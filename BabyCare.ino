@@ -1,9 +1,12 @@
+#include <WiFiEspClient.h>
+#include <WiFiEsp.h>
+#include <WiFiEspUdp.h>
+#include <PubSubClient.h>
 
 #include <DHT.h>
 #include <DHT_U.h>
 
 #include <SoftwareSerial.h>
-#include "DHT.h"
 
 
 #define RX 2    //wifi上行端口
@@ -19,10 +22,21 @@ float var_light_a=0;   //模拟数据
 int var_light_d=0;  //数字数据
 
 //Wifi接入热点及OneNet平台设备
-String ssid = "JACKPC";  //无线网账号
-String password = "87654312";  //无线网密码
-String device_id = "536315660";  //设备id
-String api_key = "1hK8AC3aucVjXMB2zVchmtaoHd0=";  //鉴权码
+char WIFI_AP[] = "JACKPC";  //无线网账号
+char WIFI_PASSWORD[] = "87654312";  //无线网密码
+//String device_id = "536315660";  //设备id
+//String api_key = "1hK8AC3aucVjXMB2zVchmtaoHd0=";  //鉴权码
+
+char mqttServer[] = "188.131.133.135";
+
+WiFiEspClient espClient;
+
+PubSubClient client(espClient);
+
+SoftwareSerial soft(RX, TX);
+
+int status = WL_IDLE_STATUS;
+unsigned long lastSend;
 
 
 //声音传感器变量
@@ -69,32 +83,16 @@ void setup() {
   pinMode(redled, OUTPUT);  
   pinMode(yellowled, OUTPUT); 
   pinMode(greenled, OUTPUT); 
- 
 
+  InitWiFi();                                // 连接WiFi
+  client.setServer( mqttServer, 1883 );      // 连接WiFi之后，连接MQTT服务器
   
-  while (!Serial) {
-    // wait for serial port to connect. Needed for native USB port only
-  }
-
-  // 连接WIFI  
-  mySerial.begin(9600);
-  mySerial.println("AT+RST");   // 初始化重启一次esp8266
-  delay(1500);
-  echo();
-  mySerial.println("AT");
-  echo();
-  delay(500);
-  mySerial.println("AT+CWMODE=3");  // 设置Wi-Fi模式
-  echo();
-  mySerial.println("AT+CWJAP=\""+ssid+"\",\""+password+"\"");  // 连接Wi-Fi
-  echo();
-  delay(10000);
-
+  lastSend = 0;
+ 
 }
 
  
 void loop() {
-
 
     //声音传感器
     LisAValue = analogRead(ListenAPin);    //读声音传感器的值  
@@ -133,7 +131,8 @@ void loop() {
 
 
   //温湿度传感器获取数据      
-  String DTHvalue=getAndSendTemperatureAndHumidityData(); 
+  String humData = getHumidityData();
+  String temData = getTemperatureData();
 
 
   //光敏传感器
@@ -166,71 +165,112 @@ void loop() {
     digitalWrite(greenled, LOW);   
    }
 
-   
-  
 
-  //WiFi串口
-  if (mySerial.available()) {  //软串口，发送到esp8266的都走这个串口
-    Serial.write(mySerial.read());
+  status = WiFi.status();
+  if ( status != WL_CONNECTED) {
+    while ( status != WL_CONNECTED) {
+      Serial.print("[loop()]Attempting to connect to WPA SSID: ");
+      Serial.println(WIFI_AP);
+      // 连接WiFi热点
+      status = WiFi.begin(WIFI_AP, WIFI_PASSWORD);
+      delay(500);
+    }
+    Serial.println("[loop()]Connected to AP");
   }
-  if (Serial.available()) {  //串口，打印到串口监视器
-    mySerial.write(Serial.read());
+
+  if (!client.connected() ) {
+    reconnect();
   }
+
+  // 构建一个 JSON 格式的payload的字符串
+  String payload = "{";
+  payload += "\"LisLimit\":"; payload += String(LisLimit); payload += ",";
+  payload += "\"PIRState\":"; payload += String(PIRState); payload += ",";
+  payload += "\"humData\":"; payload += String(humData); payload += ",";
+  payload += "\"temData\":"; payload += String(temData); payload += ",";
+  payload += "\"var_light_a\":"; payload += String(var_light_a); payload += ",";
+  payload += "\"LisAValue\":"; payload += String(LisAValue); payload += ",";
+ 
+  payload += "\"present\":"; payload += String(present);
+  payload += "}";
     
-  String value = String(LisLimit)+","+String(PIRState)+","+DTHvalue+","+String(var_light_a)+","+String(LisAValue)+","+String(present);  //上传的数据
+//  String value = String(LisLimit)+","+String(PIRState)+","+DTHvalue+","+String(var_light_a)+","+String(LisAValue)+","+String(present);  //上传的数据
 
-  post(value);
+  if ( millis() - lastSend > 1000 ) { // 用于定时1秒钟发送一次数据
+    char attributes[120];
+    payload.toCharArray( attributes, 120 );
+    client.publish( "data", attributes );
+    lastSend = millis();
+  }
   
+  client.loop();
 }
 
 
 //温湿度传感器函数
-String getAndSendTemperatureAndHumidityData(){
-  float h = dht.readHumidity();
+String getTemperatureData(){
   float t = dht.readTemperature();
 
-  if (isnan(h) || isnan(t)) {
+  if (isnan(t)) {
+    Serial.println("Failed to read from DHT sensor!");
+    return;
+  }
+  
+  return String(t);
+}
+
+String getHumidityData(){
+  float h = dht.readHumidity();
+
+  if (isnan(h)) {
     Serial.println("Failed to read from DHT sensor!");
     return;
   }
 
-  Serial.print("Humidity: ");
-  Serial.print(h);
-  Serial.println();
-  Serial.print("Temperature: ");
-  Serial.print(t);
-  Serial.print(" *C ");
-
-  return String(h)+","+String(t);
+  return String(h);
 }
 
-
-//读取应答消息
-void echo(){
-  delay(50);
-  while (mySerial.available()) {
-    Serial.write(mySerial.read());
+void InitWiFi()
+{
+  // 初始化软串口，软串口连接ESP模块
+  soft.begin(9600);
+  // 初始化ESP模块
+  WiFi.init(&soft);
+  // 检测WiFi模块在不在，宏定义：WL_NO_SHIELD = 255,WL_IDLE_STATUS = 0,
+  if (WiFi.status() == WL_NO_SHIELD) {
+    Serial.println("WiFi shield not present");
+    while (true);
   }
+
+  Serial.println("[InitWiFi]Connecting to AP ...");
+  // 尝试连接WiFi网络
+  while ( status != WL_CONNECTED) {
+    Serial.print("[InitWiFi]Attempting to connect to WPA SSID: ");
+    Serial.println(WIFI_AP);
+    // Connect to WPA/WPA2 network
+    status = WiFi.begin(WIFI_AP, WIFI_PASSWORD);
+    delay(500);
+  }
+  Serial.println("[InitWiFi]Connected to AP");
 }
 
- //上传数据点
-void post(String value){
-  mySerial.println("AT+CIPMODE=1");
-  echo();
-  mySerial.println("AT+CIPSTART=\"TCP\",\"api.heclouds.com\",80");  // 连接服务器的80端口
-  delay(100);//初始值1000
-  echo();
-  mySerial.println("AT+CIPSEND"); // 进入TCP透传模式，接下来发送的所有消息都会发送给服务器
-  echo();
-  delay(500); //初始值5000
-  String data ="{\"datastreams\": [{\"id\": \"temperature\",\"datapoints\": [{\"value\": \""+value+"\"}]}]}";
-  mySerial.print("POST /devices/"+device_id+"/datapoints HTTP/1.1\r\n"); // 开始发送post请求
-  mySerial.print("api-key: "+api_key+"\r\nHost: api.heclouds.com\r\nContent-Length: " + String(data.length()) + "\r\n\r\n"); // post请求的报文格式
-  mySerial.println(data); // 结束post请求
-  delay(300);//初始值300
-  echo();
-  delay(100); //初始值100
-  mySerial.print("+++"); // 退出tcp透传模式，用println会出错
-  Serial.println();
-//  delay(2000);  
+/**
+ * 
+ * MQTT客户端断线重连函数
+ * 
+ */
+void reconnect() {
+  // 一直循环直到连接上MQTT服务器
+  while (!client.connected()) {
+    Serial.print("[reconnect]Connecting to MQTT Server ...");
+    // 尝试连接connect是个重载函数 (clientId, username, password)
+    if ( client.connect("mqtt", NULL, NULL, "kill", 1, false, "kill") ) {
+      Serial.println( "[DONE]" );
+    } else {
+      Serial.print( "[FAILED] [ mqtt connect error code = " );
+      Serial.print( client.state() );
+      Serial.println( " : retrying in 5 seconds]" );    // Wait 5 seconds before retrying
+      delay( 5000 );
+    }
+  }
 }
